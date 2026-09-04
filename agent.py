@@ -222,8 +222,8 @@ for _s in range(64):
     _cdr = max(3 - (_s >> 3), (_s >> 3) - 4, 0)
     _CENTER.append(_cdf + _cdr)
 _CENTER_DIST_A = np.array(_CENTER, dtype=np.int32)
-MOPUP_LEAD = 350   # material lead (cp) before the winning side starts hunting the king
-MOPUP_BARE = 1500  # only hunt once the losing side is down to about a rook + minor or less
+MOPUP_LEAD = 450   # material lead (cp) before the winning side starts hunting the king
+MOPUP_BARE = 130   # only hunt a near-bare king (at most a lone pawn): always a safe win
 
 
 @njit(cache=False)
@@ -784,7 +784,7 @@ class Searcher:
         t = float(time_left_ms)
         if t <= 0:
             return 0.0, 0.0
-        soft = t / 30.0
+        soft = t / 24.0
         hard = t / 10.0
         # never risk the clock: leave a margin for our own return overhead
         hard = min(hard, t - 300.0) if t > 600.0 else t * 0.4
@@ -810,6 +810,7 @@ class Searcher:
 
         best_move = self.order(board, list(legal), None, 0)[0]
         prev = 0
+        prev_best: chess.Move | None = None
         for depth in range(1, MAX_DEPTH + 1):
             self.path = {}
             try:
@@ -820,7 +821,12 @@ class Searcher:
             prev = score
             if abs(score) >= MATE_THRESHOLD:  # forced mate found, no need to search deeper
                 break
-            if (time.monotonic() - self.start) * 1000.0 >= soft_ms:
+            # Spend longer while the best move is still unsettled: an unstable root move
+            # means the position is critical and the extra depth is worth the clock.
+            unstable = move != prev_best
+            prev_best = move
+            effective_soft = min(soft_ms * 1.5, self.hard_ms) if unstable else soft_ms
+            if (time.monotonic() - self.start) * 1000.0 >= effective_soft:
                 break
         return best_move.uci()
 
