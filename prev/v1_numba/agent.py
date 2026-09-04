@@ -186,33 +186,6 @@ _MG_B_A = np.array(MG_B, dtype=np.int32)
 _EG_B_A = np.array(EG_B, dtype=np.int32)
 _PHASE_A = np.array(PHASE_INC, dtype=np.int32)
 
-# --- Bitboard masks for the structural evaluation terms -----------------------------
-_FILE_BB = [0x0101010101010101 << f for f in range(8)]
-_RANK_BB = [0xFF << (8 * r) for r in range(8)]
-_ADJ_BB = [(_FILE_BB[f - 1] if f > 0 else 0) | (_FILE_BB[f + 1] if f < 7 else 0) for f in range(8)]
-# For a pawn on square s, the enemy-pawn-free zone that makes it passed: its file plus the
-# adjacent files, on every rank ahead of it (towards promotion).
-_WPASS = [0] * 64
-_BPASS = [0] * 64
-for _s in range(64):
-    _span = _FILE_BB[_s & 7] | _ADJ_BB[_s & 7]
-    _WPASS[_s] = sum(_span & _RANK_BB[_rr] for _rr in range((_s >> 3) + 1, 8))
-    _BPASS[_s] = sum(_span & _RANK_BB[_rr] for _rr in range(0, _s >> 3))
-
-_FILE_A = np.array(_FILE_BB, dtype=np.uint64)
-_ADJ_A = np.array(_ADJ_BB, dtype=np.uint64)
-_WPASS_A = np.array(_WPASS, dtype=np.uint64)
-_BPASS_A = np.array(_BPASS, dtype=np.uint64)
-# Passed-pawn bonus indexed by the pawn's own advancement (0..7); worth far more in the endgame.
-_PASSED_MG = np.array([0, 4, 8, 16, 30, 55, 95, 0], dtype=np.int32)
-_PASSED_EG = np.array([0, 8, 14, 28, 50, 85, 140, 0], dtype=np.int32)
-
-# Structural weights (centipawns). Midgame-only terms fade out through the taper.
-ISO_MG, ISO_EG = 12, 8       # isolated pawn (no friendly pawn on adjacent files)
-DOUB_MG, DOUB_EG = 8, 12     # doubled pawn (another friendly pawn on its file)
-ROOK_OPEN, ROOK_SEMI = 22, 10  # rook on a fully / half open file
-KS_OPEN = 16                 # per open/half-open file next to the king (scaled by enemy queen)
-
 
 @njit(cache=False)
 def _eval_bb(
@@ -225,22 +198,16 @@ def _eval_bb(
     white: np.uint64,
     black: np.uint64,
 ) -> int:
-    """White-relative tapered evaluation, jitted for speed.
+    """White-relative tapered material + piece-square score, jitted for speed.
 
-    Material + piece-square tables (the fast bitboard scan that replaced piece_map),
-    plus structural terms that a material-only eval was blind to: pawn structure
-    (passed / isolated / doubled), rooks on open files, and king safety (open files
-    next to the king). King-safety and rook terms live in the midgame score so they
-    fade as the board empties. All terms read straight from bitboards, no move gen.
+    Scans the piece bitboards directly instead of building python-chess Piece objects,
+    which is where most of the pure-python evaluation cost went. Numerically identical
+    to the list-based tables above, so search behaviour is unchanged, only faster.
     """
     mg = 0
     eg = 0
     phase = 0
     occ = white | black
-    wpawns = pawns & white
-    bpawns = pawns & black
-    wk = 0
-    bk = 0
     one = np.uint64(1)
     for sq in range(64):
         mask = one << np.uint64(sq)
@@ -259,73 +226,12 @@ def _eval_bb(
         else:
             t = 6
         phase += int(_PHASE_A[t])
-        white_pc = (white & mask) != 0
-        if white_pc:
+        if (white & mask) != 0:
             mg += int(_MG_W_A[t, sq])
             eg += int(_EG_W_A[t, sq])
         else:
             mg -= int(_MG_B_A[t, sq])
             eg -= int(_EG_B_A[t, sq])
-
-        if t == 1:  # pawn structure
-            f = sq & 7
-            r = sq >> 3
-            if white_pc:
-                if (bpawns & _WPASS_A[sq]) == 0:
-                    mg += int(_PASSED_MG[r])
-                    eg += int(_PASSED_EG[r])
-                if (wpawns & _ADJ_A[f]) == 0:
-                    mg -= ISO_MG
-                    eg -= ISO_EG
-                if (wpawns & _FILE_A[f]) != mask:
-                    mg -= DOUB_MG
-                    eg -= DOUB_EG
-            else:
-                if (wpawns & _BPASS_A[sq]) == 0:
-                    mg -= int(_PASSED_MG[7 - r])
-                    eg -= int(_PASSED_EG[7 - r])
-                if (bpawns & _ADJ_A[f]) == 0:
-                    mg += ISO_MG
-                    eg += ISO_EG
-                if (bpawns & _FILE_A[f]) != mask:
-                    mg += DOUB_MG
-                    eg += DOUB_EG
-        elif t == 4:  # rook on open / half-open file
-            f = sq & 7
-            if white_pc:
-                if (wpawns & _FILE_A[f]) == 0:
-                    mg += ROOK_OPEN if (bpawns & _FILE_A[f]) == 0 else ROOK_SEMI
-            else:
-                if (bpawns & _FILE_A[f]) == 0:
-                    mg -= ROOK_OPEN if (wpawns & _FILE_A[f]) == 0 else ROOK_SEMI
-        elif t == 6:
-            if white_pc:
-                wk = sq
-            else:
-                bk = sq
-
-    # King safety: open or half-open files beside the king are dangerous, most of all
-    # while the enemy queen is on. A midgame concern, so it rides in `mg`.
-    wpen = 0
-    kf = wk & 7
-    for df in range(-1, 2):
-        ff = kf + df
-        if ff >= 0 and ff <= 7 and (wpawns & _FILE_A[ff]) == 0:
-            wpen += KS_OPEN
-    if (queens & black) == 0:
-        wpen //= 3
-    mg -= wpen
-
-    bpen = 0
-    kf = bk & 7
-    for df in range(-1, 2):
-        ff = kf + df
-        if ff >= 0 and ff <= 7 and (bpawns & _FILE_A[ff]) == 0:
-            bpen += KS_OPEN
-    if (queens & white) == 0:
-        bpen //= 3
-    mg += bpen
-
     if phase > PHASE_MAX:
         phase = PHASE_MAX
     return (mg * phase + eg * (PHASE_MAX - phase)) // PHASE_MAX

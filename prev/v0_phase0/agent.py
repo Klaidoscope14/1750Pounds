@@ -15,8 +15,6 @@ import time
 from collections.abc import Hashable
 
 import chess
-import numpy as np
-from numba import njit
 
 # --- Scores -----------------------------------------------------------------------
 
@@ -179,158 +177,6 @@ for _pt in range(1, 7):
         MG_B[_pt][_sq] = MG_PIECE[_pt] + _MG_PST[_pt][_sq]
         EG_B[_pt][_sq] = EG_PIECE[_pt] + _EG_PST[_pt][_sq]
 
-# numpy copies of the same tables, frozen into the jitted evaluation below.
-_MG_W_A = np.array(MG_W, dtype=np.int32)
-_EG_W_A = np.array(EG_W, dtype=np.int32)
-_MG_B_A = np.array(MG_B, dtype=np.int32)
-_EG_B_A = np.array(EG_B, dtype=np.int32)
-_PHASE_A = np.array(PHASE_INC, dtype=np.int32)
-
-# --- Bitboard masks for the structural evaluation terms -----------------------------
-_FILE_BB = [0x0101010101010101 << f for f in range(8)]
-_RANK_BB = [0xFF << (8 * r) for r in range(8)]
-_ADJ_BB = [(_FILE_BB[f - 1] if f > 0 else 0) | (_FILE_BB[f + 1] if f < 7 else 0) for f in range(8)]
-# For a pawn on square s, the enemy-pawn-free zone that makes it passed: its file plus the
-# adjacent files, on every rank ahead of it (towards promotion).
-_WPASS = [0] * 64
-_BPASS = [0] * 64
-for _s in range(64):
-    _span = _FILE_BB[_s & 7] | _ADJ_BB[_s & 7]
-    _WPASS[_s] = sum(_span & _RANK_BB[_rr] for _rr in range((_s >> 3) + 1, 8))
-    _BPASS[_s] = sum(_span & _RANK_BB[_rr] for _rr in range(0, _s >> 3))
-
-_FILE_A = np.array(_FILE_BB, dtype=np.uint64)
-_ADJ_A = np.array(_ADJ_BB, dtype=np.uint64)
-_WPASS_A = np.array(_WPASS, dtype=np.uint64)
-_BPASS_A = np.array(_BPASS, dtype=np.uint64)
-# Passed-pawn bonus indexed by the pawn's own advancement (0..7); worth far more in the endgame.
-_PASSED_MG = np.array([0, 4, 8, 16, 30, 55, 95, 0], dtype=np.int32)
-_PASSED_EG = np.array([0, 8, 14, 28, 50, 85, 140, 0], dtype=np.int32)
-
-# Structural weights (centipawns). Midgame-only terms fade out through the taper.
-ISO_MG, ISO_EG = 12, 8       # isolated pawn (no friendly pawn on adjacent files)
-DOUB_MG, DOUB_EG = 8, 12     # doubled pawn (another friendly pawn on its file)
-ROOK_OPEN, ROOK_SEMI = 22, 10  # rook on a fully / half open file
-KS_OPEN = 16                 # per open/half-open file next to the king (scaled by enemy queen)
-
-
-@njit(cache=False)
-def _eval_bb(
-    pawns: np.uint64,
-    knights: np.uint64,
-    bishops: np.uint64,
-    rooks: np.uint64,
-    queens: np.uint64,
-    kings: np.uint64,
-    white: np.uint64,
-    black: np.uint64,
-) -> int:
-    """White-relative tapered evaluation, jitted for speed.
-
-    Material + piece-square tables (the fast bitboard scan that replaced piece_map),
-    plus structural terms that a material-only eval was blind to: pawn structure
-    (passed / isolated / doubled), rooks on open files, and king safety (open files
-    next to the king). King-safety and rook terms live in the midgame score so they
-    fade as the board empties. All terms read straight from bitboards, no move gen.
-    """
-    mg = 0
-    eg = 0
-    phase = 0
-    occ = white | black
-    wpawns = pawns & white
-    bpawns = pawns & black
-    wk = 0
-    bk = 0
-    one = np.uint64(1)
-    for sq in range(64):
-        mask = one << np.uint64(sq)
-        if (occ & mask) == 0:
-            continue
-        if (pawns & mask) != 0:
-            t = 1
-        elif (knights & mask) != 0:
-            t = 2
-        elif (bishops & mask) != 0:
-            t = 3
-        elif (rooks & mask) != 0:
-            t = 4
-        elif (queens & mask) != 0:
-            t = 5
-        else:
-            t = 6
-        phase += int(_PHASE_A[t])
-        white_pc = (white & mask) != 0
-        if white_pc:
-            mg += int(_MG_W_A[t, sq])
-            eg += int(_EG_W_A[t, sq])
-        else:
-            mg -= int(_MG_B_A[t, sq])
-            eg -= int(_EG_B_A[t, sq])
-
-        if t == 1:  # pawn structure
-            f = sq & 7
-            r = sq >> 3
-            if white_pc:
-                if (bpawns & _WPASS_A[sq]) == 0:
-                    mg += int(_PASSED_MG[r])
-                    eg += int(_PASSED_EG[r])
-                if (wpawns & _ADJ_A[f]) == 0:
-                    mg -= ISO_MG
-                    eg -= ISO_EG
-                if (wpawns & _FILE_A[f]) != mask:
-                    mg -= DOUB_MG
-                    eg -= DOUB_EG
-            else:
-                if (wpawns & _BPASS_A[sq]) == 0:
-                    mg -= int(_PASSED_MG[7 - r])
-                    eg -= int(_PASSED_EG[7 - r])
-                if (bpawns & _ADJ_A[f]) == 0:
-                    mg += ISO_MG
-                    eg += ISO_EG
-                if (bpawns & _FILE_A[f]) != mask:
-                    mg += DOUB_MG
-                    eg += DOUB_EG
-        elif t == 4:  # rook on open / half-open file
-            f = sq & 7
-            if white_pc:
-                if (wpawns & _FILE_A[f]) == 0:
-                    mg += ROOK_OPEN if (bpawns & _FILE_A[f]) == 0 else ROOK_SEMI
-            else:
-                if (bpawns & _FILE_A[f]) == 0:
-                    mg -= ROOK_OPEN if (wpawns & _FILE_A[f]) == 0 else ROOK_SEMI
-        elif t == 6:
-            if white_pc:
-                wk = sq
-            else:
-                bk = sq
-
-    # King safety: open or half-open files beside the king are dangerous, most of all
-    # while the enemy queen is on. A midgame concern, so it rides in `mg`.
-    wpen = 0
-    kf = wk & 7
-    for df in range(-1, 2):
-        ff = kf + df
-        if ff >= 0 and ff <= 7 and (wpawns & _FILE_A[ff]) == 0:
-            wpen += KS_OPEN
-    if (queens & black) == 0:
-        wpen //= 3
-    mg -= wpen
-
-    bpen = 0
-    kf = bk & 7
-    for df in range(-1, 2):
-        ff = kf + df
-        if ff >= 0 and ff <= 7 and (bpawns & _FILE_A[ff]) == 0:
-            bpen += KS_OPEN
-    if (queens & white) == 0:
-        bpen //= 3
-    mg += bpen
-
-    if phase > PHASE_MAX:
-        phase = PHASE_MAX
-    return (mg * phase + eg * (PHASE_MAX - phase)) // PHASE_MAX
-
-
 BISHOP_PAIR = 30
 TEMPO = 12
 
@@ -374,28 +220,32 @@ class Searcher:
 
     def evaluate(self, board: chess.Board) -> int:
         """Static evaluation from the side-to-move's perspective, in centipawns."""
+        mg = 0
+        eg = 0
+        phase = 0
         white = board.occupied_co[chess.WHITE]
-        black = board.occupied_co[chess.BLACK]
-        score = int(
-            _eval_bb(
-                np.uint64(board.pawns),
-                np.uint64(board.knights),
-                np.uint64(board.bishops),
-                np.uint64(board.rooks),
-                np.uint64(board.queens),
-                np.uint64(board.kings),
-                np.uint64(white),
-                np.uint64(black),
-            )
-        )
+        for square, piece in board.piece_map().items():
+            pt = piece.piece_type
+            phase += PHASE_INC[pt]
+            if (1 << square) & white:
+                mg += MG_W[pt][square]
+                eg += EG_W[pt][square]
+            else:
+                mg -= MG_B[pt][square]
+                eg -= EG_B[pt][square]
 
-        # bishop pair (constant across the taper, so it adds directly to the score)
+        # bishop pair
         bishops = board.bishops
         if (bishops & white).bit_count() >= 2:
-            score += BISHOP_PAIR
-        if (bishops & black).bit_count() >= 2:
-            score -= BISHOP_PAIR
+            mg += BISHOP_PAIR
+            eg += BISHOP_PAIR
+        if (bishops & board.occupied_co[chess.BLACK]).bit_count() >= 2:
+            mg -= BISHOP_PAIR
+            eg -= BISHOP_PAIR
 
+        if phase > PHASE_MAX:
+            phase = PHASE_MAX
+        score = (mg * phase + eg * (PHASE_MAX - phase)) // PHASE_MAX  # white-relative
         score = score if board.turn == chess.WHITE else -score
         return score + TEMPO
 
@@ -691,17 +541,6 @@ class Searcher:
 
 
 SEARCHER = Searcher()
-
-
-def _warm_up() -> None:
-    """Compile the jitted evaluation now, inside the 60 s import budget, so the first
-    real move does not pay numba's per-signature compile cost on the game clock. Warm
-    with the exact argument types (np.uint64) the search will call it with."""
-    board = chess.Board()
-    SEARCHER.evaluate(board)
-
-
-_warm_up()
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
