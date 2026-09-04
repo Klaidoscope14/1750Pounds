@@ -213,18 +213,6 @@ DOUB_MG, DOUB_EG = 8, 12     # doubled pawn (another friendly pawn on its file)
 ROOK_OPEN, ROOK_SEMI = 22, 10  # rook on a fully / half open file
 KS_OPEN = 16                 # per open/half-open file next to the king (scaled by enemy queen)
 
-# Mop-up: material by piece type (for the winning-side gate), and each square's distance
-# from the centre (0 centre .. 6 corner) so the winning side can drive the lone king to the edge.
-_MAT_A = np.array([0, 100, 320, 330, 500, 900, 0], dtype=np.int32)
-_CENTER = []
-for _s in range(64):
-    _cdf = max(3 - (_s & 7), (_s & 7) - 4, 0)
-    _cdr = max(3 - (_s >> 3), (_s >> 3) - 4, 0)
-    _CENTER.append(_cdf + _cdr)
-_CENTER_DIST_A = np.array(_CENTER, dtype=np.int32)
-MOPUP_LEAD = 350   # material lead (cp) before the winning side starts hunting the king
-MOPUP_BARE = 1500  # only hunt once the losing side is down to about a rook + minor or less
-
 
 @njit(cache=False)
 def _eval_bb(
@@ -253,8 +241,6 @@ def _eval_bb(
     bpawns = pawns & black
     wk = 0
     bk = 0
-    wmat = 0
-    bmat = 0
     one = np.uint64(1)
     for sq in range(64):
         mask = one << np.uint64(sq)
@@ -277,11 +263,9 @@ def _eval_bb(
         if white_pc:
             mg += int(_MG_W_A[t, sq])
             eg += int(_EG_W_A[t, sq])
-            wmat += int(_MAT_A[t])
         else:
             mg -= int(_MG_B_A[t, sq])
             eg -= int(_EG_B_A[t, sq])
-            bmat += int(_MAT_A[t])
 
         if t == 1:  # pawn structure
             f = sq & 7
@@ -341,17 +325,6 @@ def _eval_bb(
     if (queens & white) == 0:
         bpen //= 3
     mg += bpen
-
-    # Mop-up: once one side is clearly ahead and the other is down to scraps, drive the
-    # losing king to a corner and march the winning king in. An endgame job, so it rides
-    # in `eg` and the taper keeps it out of the middlegame.
-    lead = wmat - bmat
-    if lead > MOPUP_LEAD and bmat <= MOPUP_BARE:
-        king_dist = abs((wk & 7) - (bk & 7)) + abs((wk >> 3) - (bk >> 3))
-        eg += 5 * int(_CENTER_DIST_A[bk]) + 2 * (14 - king_dist)
-    elif lead < -MOPUP_LEAD and wmat <= MOPUP_BARE:
-        king_dist = abs((wk & 7) - (bk & 7)) + abs((wk >> 3) - (bk >> 3))
-        eg -= 5 * int(_CENTER_DIST_A[wk]) + 2 * (14 - king_dist)
 
     if phase > PHASE_MAX:
         phase = PHASE_MAX
