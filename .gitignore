@@ -7,3 +7,5 @@ submission.zip
 
 training/data/
 training/*.pt
+training/*.onnx
+training/*.onnx.data

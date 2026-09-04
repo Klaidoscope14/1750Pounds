@@ -16,8 +16,6 @@ from collections.abc import Hashable
 
 import chess
 import numpy as np
-import torch
-import torch.nn as nn
 from numba import njit
 
 # --- Scores -----------------------------------------------------------------------
@@ -28,9 +26,6 @@ MATE_THRESHOLD = 29_000      # scores beyond this magnitude are "a mate is invol
 MAX_PLY = 128
 MAX_DEPTH = 64
 TT_LIMIT = 3_000_000         # cap the table so a long game cannot exhaust 2 GB
-
-NN_MODEL = "training/value_net.pt"
-NN_ROOT_WEIGHT = 0.15
 
 # --- Evaluation tables ------------------------------------------------------------
 # Material and piece-square tables are the well-known public-domain "PeSTO" set, a
@@ -358,52 +353,6 @@ class TimeUp(Exception):
     """Raised deep in the search when the move budget is spent, to unwind cleanly."""
 
 
-def _encode_nn(board: chess.Board) -> np.ndarray:
-    x = np.zeros(772, dtype=np.float32)
-
-    for square, piece in board.piece_map().items():
-        piece_index = (piece.piece_type - 1) + (0 if piece.color else 6)
-        x[piece_index * 64 + square] = 1.0
-
-    x[768] = 1.0 if board.turn == chess.WHITE else 0.0
-    x[769] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    x[770] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    x[771] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-
-    return x
-
-
-class ValueNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(772, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Tanh()
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-NN_MODEL_INSTANCE = ValueNet()
-NN_MODEL_INSTANCE.load_state_dict(
-    torch.load(NN_MODEL, map_location="cpu")
-)
-NN_MODEL_INSTANCE.eval()
-
-
-def _nn_value(board: chess.Board) -> float:
-    x = torch.from_numpy(_encode_nn(board)).unsqueeze(0)
-
-    with torch.no_grad():
-        return float(NN_MODEL_INSTANCE(x).item())
-
-
 class Searcher:
     def __init__(self) -> None:
         # transposition table: key -> (depth, score, flag, best_move).
@@ -420,8 +369,6 @@ class Searcher:
         self.nodes = 0
         self.start = 0.0
         self.hard_ms = 0.0
-        self.root_nn_key = None
-        self.root_nn_scores: dict[chess.Move, float] = {}
 
     # -- evaluation ----------------------------------------------------------------
 
@@ -671,27 +618,6 @@ class Searcher:
         entry = self.tt.get(key)
         tt_move = entry[3] if entry is not None else None
         moves = self.order(board, list(board.legal_moves), tt_move, 0)
-
-        original_order = list(moves)
-
-        if self.root_nn_key != key:
-            self.root_nn_key = key
-            self.root_nn_scores = {}
-
-            for move in original_order:
-                board.push(move)
-                self.root_nn_scores[move] = -_nn_value(board)
-                board.pop()
-
-        rank = {
-            move: len(original_order) - i
-            for i, move in enumerate(original_order)
-        }
-
-        moves.sort(
-            key=lambda move: rank[move] + self.root_nn_scores[move] * 10.0 * NN_ROOT_WEIGHT,
-            reverse=True
-        )
 
         alpha, beta = -INF, INF
         best = -INF
