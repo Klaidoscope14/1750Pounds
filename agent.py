@@ -12,6 +12,7 @@ and history heuristic survive from one move to the next. It is discarded between
 """
 
 import time
+from collections.abc import Hashable
 
 import chess
 
@@ -158,8 +159,9 @@ EG_KING = [
 ]
 # fmt: on
 
-_MG_PST = [None, MG_PAWN, MG_KNIGHT, MG_BISHOP, MG_ROOK, MG_QUEEN, MG_KING]
-_EG_PST = [None, EG_PAWN, EG_KNIGHT, EG_BISHOP, EG_ROOK, EG_QUEEN, EG_KING]
+_ZERO = [0] * 64  # index 0 is unused; piece_type runs 1..6 (pawn..king)
+_MG_PST = [_ZERO, MG_PAWN, MG_KNIGHT, MG_BISHOP, MG_ROOK, MG_QUEEN, MG_KING]
+_EG_PST = [_ZERO, EG_PAWN, EG_KNIGHT, EG_BISHOP, EG_ROOK, EG_QUEEN, EG_KING]
 
 # Precompute per-colour lookup: value + piece-square bonus, indexed [piece_type][square].
 # A white piece on `square` reads the diagram at square ^ 56 (vertical flip); a black piece
@@ -199,16 +201,17 @@ class TimeUp(Exception):
 
 class Searcher:
     def __init__(self) -> None:
-        # transposition table: key -> (depth, score, flag, best_move)
-        self.tt: dict[tuple, tuple[int, int, int, chess.Move | None]] = {}
+        # transposition table: key -> (depth, score, flag, best_move).
+        # Keys are board._transposition_key() values, typed Hashable by python-chess.
+        self.tt: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
         # history heuristic: (from_square, to_square) -> score, kept across the game
         self.history: dict[tuple[int, int], int] = {}
         # killer moves per ply, reset each search
         self.killers: list[list[chess.Move | None]] = []
         # keys of positions that actually occurred in the game (for repetition draws)
-        self.seen: dict[tuple, int] = {}
+        self.seen: dict[Hashable, int] = {}
         # keys currently on the search stack, for repetition detection within a line
-        self.path: dict[tuple, int] = {}
+        self.path: dict[Hashable, int] = {}
         self.nodes = 0
         self.start = 0.0
         self.hard_ms = 0.0
@@ -282,7 +285,7 @@ class Searcher:
     # -- transposition table -------------------------------------------------------
 
     def tt_store(
-        self, key: tuple, depth: int, score: int, flag: int, move: chess.Move | None, ply: int
+        self, key: Hashable, depth: int, score: int, flag: int, move: chess.Move | None, ply: int
     ) -> None:
         if len(self.tt) >= TT_LIMIT:
             self.tt.clear()
@@ -399,17 +402,21 @@ class Searcher:
         best_move: chess.Move | None = None
         self.path[key] = self.path.get(key, 0) + 1
         try:
-            move_count = 0
-            for move in moves:
+            # gives_check() is last in the guard so it runs only when the cheap
+            # late-move-reduction conditions already hold (Python short-circuits).
+            for move_count, move in enumerate(moves):
                 is_capture = board.is_capture(move)
                 is_quiet = not is_capture and move.promotion is None
 
                 reduction = 0
-                if is_quiet and depth >= 3 and move_count >= 4 and not in_check:
-                    if not board.gives_check(move):
-                        reduction = 1
-                        if move_count >= 8 and depth >= 5:
-                            reduction = 2
+                if (
+                    is_quiet
+                    and depth >= 3
+                    and move_count >= 4
+                    and not in_check
+                    and not board.gives_check(move)
+                ):
+                    reduction = 2 if (move_count >= 8 and depth >= 5) else 1
 
                 board.push(move)
                 if move_count == 0:
@@ -421,7 +428,6 @@ class Searcher:
                     if alpha < score < beta:
                         score = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1)
                 board.pop()
-                move_count += 1
 
                 if score > best:
                     best = score
@@ -439,7 +445,7 @@ class Searcher:
         self.tt_store(key, depth, best, flag, best_move, ply)
         return best
 
-    def _path_pop(self, key: tuple) -> None:
+    def _path_pop(self, key: Hashable) -> None:
         count = self.path.get(key, 0) - 1
         if count > 0:
             self.path[key] = count
