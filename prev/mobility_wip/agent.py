@@ -222,9 +222,60 @@ for _s in range(64):
     _cdr = max(3 - (_s >> 3), (_s >> 3) - 4, 0)
     _CENTER.append(_cdf + _cdr)
 _CENTER_DIST_A = np.array(_CENTER, dtype=np.int32)
-MOPUP_LEAD = 300   # material lead (cp) before the winning side starts hunting the king
+MOPUP_LEAD = 450   # material lead (cp) before the winning side starts hunting the king
 MOPUP_BARE = 130   # only hunt a near-bare king (at most a lone pawn): always a safe win
 
+# Mobility: how many squares each piece can move to (own pieces block, an enemy square
+# counts then stops the ray). Scored relative to a per-piece baseline so it rewards
+# activity rather than double-counting material. Knight uses a lookup; sliders trace rays.
+_KNIGHT_DELTAS = [(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)]
+_KNIGHT_ATT = [0] * 64
+for _s in range(64):
+    _kf = _s & 7
+    _kr = _s >> 3
+    for _dfa, _dra in _KNIGHT_DELTAS:
+        _ff = _kf + _dfa
+        _rr = _kr + _dra
+        if 0 <= _ff <= 7 and 0 <= _rr <= 7:
+            _KNIGHT_ATT[_s] |= 1 << (_rr * 8 + _ff)
+_KNIGHT_ATT_A = np.array(_KNIGHT_ATT, dtype=np.uint64)
+_DIAG = np.array([[1, 1], [1, -1], [-1, 1], [-1, -1]], dtype=np.int64)
+_ORTH = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]], dtype=np.int64)
+_ALL8 = np.array([[1, 1], [1, -1], [-1, 1], [-1, -1], [1, 0], [-1, 0], [0, 1], [0, -1]], np.int64)
+# per-piece (weight, baseline) for piece_type 0..6; contribution = (mobility - base) * weight
+MOB_W = np.array([0, 0, 4, 3, 2, 1, 0], dtype=np.int64)
+MOB_BASE = np.array([0, 0, 4, 6, 7, 14, 0], dtype=np.int64)
+
+
+@njit(cache=False)
+def _popcount(bb: np.uint64) -> int:
+    count = 0
+    x = bb
+    while x != 0:
+        x &= x - np.uint64(1)
+        count += 1
+    return count
+
+
+@njit(cache=False)
+def _slider_mob(sq: int, occ: np.uint64, own: np.uint64, dirs: np.ndarray) -> int:
+    f0 = sq & 7
+    r0 = sq >> 3
+    cnt = 0
+    one = np.uint64(1)
+    for i in range(dirs.shape[0]):
+        f = f0 + dirs[i, 0]
+        r = r0 + dirs[i, 1]
+        while f >= 0 and f < 8 and r >= 0 and r < 8:
+            bit = one << np.uint64(r * 8 + f)
+            if (own & bit) != 0:
+                break
+            cnt += 1
+            if (occ & bit) != 0:
+                break
+            f += dirs[i, 0]
+            r += dirs[i, 1]
+    return cnt
 
 
 @njit(cache=False)
@@ -283,6 +334,24 @@ def _eval_bb(
             mg -= int(_MG_B_A[t, sq])
             eg -= int(_EG_B_A[t, sq])
             bmat += int(_MAT_A[t])
+
+        if t >= 2 and t <= 5:  # mobility (knight..queen)
+            own = white if white_pc else black
+            if t == 2:
+                m = _popcount(_KNIGHT_ATT_A[sq] & ~own)
+            elif t == 3:
+                m = _slider_mob(sq, occ, own, _DIAG)
+            elif t == 4:
+                m = _slider_mob(sq, occ, own, _ORTH)
+            else:
+                m = _slider_mob(sq, occ, own, _ALL8)
+            mob = (m - int(MOB_BASE[t])) * int(MOB_W[t])
+            if white_pc:
+                mg += mob
+                eg += mob
+            else:
+                mg -= mob
+                eg -= mob
 
         if t == 1:  # pawn structure
             f = sq & 7
